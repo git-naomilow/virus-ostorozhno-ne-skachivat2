@@ -8,6 +8,9 @@ on:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
+    env:
+      # убедимся, что ~/.local/bin доступен в PATH для всех шагов
+      PATH: ${{ github.workspace }}:${{ env.PATH }}:${HOME}/.local/bin
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,30 +24,44 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y git build-essential openjdk-17-jdk zip unzip zlib1g-dev \
-            libncurses5 libstdc++6 libffi-dev libssl-dev python3-venv python3-pip
+            libncurses6 libncurses-dev libstdc++6 libffi-dev libssl-dev python3-venv python3-pip
+        # Примечание: в Ubuntu 24.04 libncurses5 может отсутствовать, поэтому используем libncurses6/libncurses-dev
 
-      - name: Install buildozer & cython
+      - name: Install buildozer & cython (user)
         run: |
           python -m pip install --upgrade pip
           python -m pip install --user buildozer cython
-          echo "::add-path::${HOME}/.local/bin"
-        env:
-          PATH: ${{ env.PATH }}:${{ github.workspace }}/.local/bin:${HOME}/.local/bin
+        # ~/.local/bin должен быть в PATH (сверху мы добавили его в env)
 
-      - name: Initialize buildozer (optional)
+      - name: Ensure ~/.local/bin is in PATH for this step
         run: |
+          echo "PATH before: $PATH"
+          export PATH=$PATH:~/.local/bin
+          echo "PATH after: $PATH"
+        shell: bash
+
+      - name: Initialize buildozer.spec if missing
+        run: |
+          # если buildozer.spec отсутствует, создадим шаблон (не перезаписываем существующий)
           if [ ! -f buildozer.spec ]; then
             buildozer init || true
           fi
 
-      - name: Run buildozer (build debug APK)
+      - name: Build debug APK with Buildozer
         env:
+          # временная переменная для Android SDK локации (если потребуется)
           ANDROIDSDK: ${{ runner.temp }}/android-sdk
         run: |
-          # ensure ~/.local/bin is in PATH for this runner
+          # убедимся, что используем ~/.local/bin
           export PATH=$PATH:~/.local/bin
-          # build (first run will download SDK/NDK and take long time)
+          # Запуск сборки (первый запуск загрузит SDK/NDK и займет время)
           buildozer -v android debug
+        shell: bash
+
+      - name: List bin directory (for debugging)
+        run: |
+          echo "Contents of project bin/ directory:"
+          ls -la bin || true
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
