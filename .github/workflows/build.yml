@@ -1,0 +1,53 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install apt dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y git build-essential openjdk-17-jdk zip unzip zlib1g-dev \
+            libncurses5 libstdc++6 libffi-dev libssl-dev python3-venv python3-pip
+
+      - name: Install buildozer & cython
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --user buildozer cython
+          echo "::add-path::${HOME}/.local/bin"
+        env:
+          PATH: ${{ env.PATH }}:${{ github.workspace }}/.local/bin:${HOME}/.local/bin
+
+      - name: Initialize buildozer (optional)
+        run: |
+          if [ ! -f buildozer.spec ]; then
+            buildozer init || true
+          fi
+
+      - name: Run buildozer (build debug APK)
+        env:
+          ANDROIDSDK: ${{ runner.temp }}/android-sdk
+        run: |
+          # ensure ~/.local/bin is in PATH for this runner
+          export PATH=$PATH:~/.local/bin
+          # build (first run will download SDK/NDK and take long time)
+          buildozer -v android debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: bin/*.apk
