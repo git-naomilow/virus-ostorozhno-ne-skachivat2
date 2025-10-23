@@ -8,6 +8,10 @@ on:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
+    env:
+      JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+      ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+      ANDROID_HOME: ${{ runner.temp }}/android-sdk
 
     steps:
       - name: Checkout repository
@@ -22,18 +26,48 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y git build-essential openjdk-17-jdk zip unzip zlib1g-dev \
-            libncurses6 libncurses-dev libstdc++6 libffi-dev libssl-dev python3-venv python3-pip
+            libncurses6 libncurses-dev libstdc++6 libffi-dev libssl-dev python3-venv python3-pip wget
+
+      - name: Prepare Android SDK (cmdline-tools) and accept licenses
+        run: |
+          set -e
+          SDKROOT=${ANDROID_SDK_ROOT}
+          mkdir -p ${SDKROOT}
+          cd ${SDKROOT}
+          # скачать commandline tools (Google); URL может меняться — если ссылка устареет, замени на актуальную с сайта Android
+          CMDLINE_ZIP=commandlinetools-linux-latest.zip
+          wget -q -O ${CMDLINE_ZIP} https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip || \
+            wget -q -O ${CMDLINE_ZIP} https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip
+          mkdir -p cmdline-tools
+          unzip -q ${CMDLINE_ZIP} -d cmdline-tools
+          # Google кладёт tools в папку cmdline-tools/cmdline-tools или cmdline-tools/tools — нормализуем в cmdline-tools/latest
+          if [ -d cmdline-tools/cmdline-tools ]; then
+            mv cmdline-tools/cmdline-tools cmdline-tools/latest
+          else
+            mv cmdline-tools/* cmdline-tools/latest || true
+          fi
+          rm -f ${CMDLINE_ZIP}
+          # Установим переменные окружения для sdkmanager
+          export PATH=${SDKROOT}/cmdline-tools/latest/bin:${SDKROOT}/platform-tools:${PATH}
+          echo "SDK prepared at ${SDKROOT}"
+          # Создаём каталоги лицензий (иногда нужны)
+          mkdir -p ${HOME}/.android
+          touch ${HOME}/.android/repositories.cfg || true
+          # Установим минимальные компоненты: platform-tools, build-tools;<версия>, platforms;android-<api>
+          # Совет: указывай android.api в buildozer.spec (например 33) и соответствующую платформу ниже.
+          echo "y" | ${SDKROOT}/cmdline-tools/latest/bin/sdkmanager --sdk_root=${SDKROOT} "platform-tools" "platforms;android-33" "build-tools;33.0.2" || true
+          # Принять лицензии неинтерактивно
+          yes | ${SDKROOT}/cmdline-tools/latest/bin/sdkmanager --sdk_root=${SDKROOT} --licenses || true
+          # Покажем установленные пакеты (диагностика)
+          ${SDKROOT}/cmdline-tools/latest/bin/sdkmanager --sdk_root=${SDKROOT} --list || true
 
       - name: Install buildozer & cython (user)
         run: |
           python -m pip install --upgrade pip
           python -m pip install --user buildozer cython
-        # не полагаемся на job-level env; добавим ~/.local/bin в PATH в следующих шагах
-
-      - name: Ensure ~/.local/bin is in PATH for following steps
-        run: |
-          echo "Adding ~/.local/bin to PATH for this environment"
-          echo "PATH=$PATH:$HOME/.local/bin" >> $GITHUB_ENV
+        # Добавляем ~/.local/bin в PATH для последующих шагов
+      - name: Add ~/.local/bin to PATH
+        run: echo "PATH=$PATH:$HOME/.local/bin" >> $GITHUB_ENV
 
       - name: Initialize buildozer.spec if missing
         run: |
@@ -43,11 +77,18 @@ jobs:
 
       - name: Build debug APK with Buildozer
         env:
-          # временная переменная (опционально)
           ANDROIDSDK: ${{ runner.temp }}/android-sdk
+          ANDROID_HOME: ${{ runner.temp }}/android-sdk
+          ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+          PATH: ${{ env.PATH }}:$HOME/.local/bin:${{ runner.temp }}/android-sdk/cmdline-tools/latest/bin:${{ runner.temp }}/android-sdk/platform-tools
         run: |
-          # ~/.local/bin уже добавлен в PATH через $GITHUB_ENV
-          echo "Using PATH: $PATH"
+          # убедимся, что инструменты доступны
+          echo "JAVA_HOME=$JAVA_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          which sdkmanager || true
+          sdkmanager --version || true
+          # Запуск сборки Buildozer
+          export PATH=$PATH:$HOME/.local/bin
           buildozer -v android debug
         shell: bash
 
