@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Android APK (robust)
 
 on:
   push:
@@ -8,6 +8,7 @@ on:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
 
     steps:
       - name: Checkout repository
@@ -18,87 +19,169 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install apt dependencies
+      - name: Install apt dependencies (build essentials, Java, tools)
         run: |
-          sudo apt update
-          sudo apt install -y git build-essential openjdk-17-jdk zip unzip zlib1g-dev \
-            libncurses6 libncurses-dev libstdc++6 libffi-dev libssl-dev python3-venv python3-pip wget
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            openjdk-17-jdk \
+            zip unzip wget curl git \
+            zlib1g-dev libncurses6 libncurses-dev libstdc++6 \
+            libffi-dev libssl-dev python3-venv python3-pip \
+            ca-certificates
+          # note: 'aidl' is NOT available via apt; it's part of Android Build-Tools.
 
-      - name: Prepare Android SDK and install build-tools (36.1.0)
+      - name: Setup cache for Android SDK (speeds up repeated runs)
+        uses: actions/cache@v4
+        id: cache-android-sdk
+        with:
+          path: |
+            ${{ github.workspace }}/.android-sdk-cache
+            $HOME/android-sdk
+            $HOME/.buildozer
+          key: android-sdk-${{ runner.os }}-v2
+          restore-keys: |
+            android-sdk-${{ runner.os }}-v2
+
+      - name: Prepare Android SDK (cmdline-tools) and install build-tools (33 + 36.1)
+        env:
+          SDKROOT: ${{ github.workspace }}/.android-sdk-cache  # local cache location first
         run: |
           set -euo pipefail
 
-          # Путь куда установим SDK (в HOME, чтобы Buildozer мог к нему иметь доступ)
-          SDKROOT="${HOME}/android-sdk"
-          echo "SDKROOT=${SDKROOT}"
-          rm -rf "${SDKROOT}"
+          # Prefer cached location inside workspace, fallback to HOME/android-sdk
+          if [ -d "${SDKROOT}" ] && [ -n "$(ls -A ${SDKROOT} 2>/dev/null)" ]; then
+            echo "Using cached SDKROOT=${SDKROOT}"
+          else
+            SDKROOT="${HOME}/android-sdk"
+            echo "No workspace cache; using SDKROOT=${SDKROOT}"
+          fi
+
+          # Ensure clean dir and required subdirs
           mkdir -p "${SDKROOT}"
           cd "${SDKROOT}"
 
-          # Скачиваем commandline tools (две попытки по возможным URL)
+          # Download commandline tools (two fallback URLs)
           CMDLINE_ZIP=commandlinetools-linux-latest.zip
-          wget -q -O ${CMDLINE_ZIP} https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip || \
-            wget -q -O ${CMDLINE_ZIP} https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip || \
-            (echo "Failed to download commandlinetools zip; please update URL" && exit 1)
+          echo "Downloading commandline tools..."
+          if ! wget -q -O ${CMDLINE_ZIP} https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip ; then
+            wget -q -O ${CMDLINE_ZIP} https://dl.google.com/android/repository/commandlinetools-linux-8512546_latest.zip
+          fi
 
           mkdir -p cmdline-tools
-          unzip -q ${CMDLINE_ZIP} -d cmdline-tools
-          # Нормализуем структуру в cmdline-tools/latest
+          unzip -q ${CMDLINE_ZIP} -d cmdline-tools || ( echo "unzip failed" && ls -la && exit 1 )
+
+          # Normalize into cmdline-tools/latest
           if [ -d cmdline-tools/cmdline-tools ]; then
+            rm -rf cmdline-tools/latest || true
             mv cmdline-tools/cmdline-tools cmdline-tools/latest
           else
+            rm -rf cmdline-tools/latest || true
             mv cmdline-tools/* cmdline-tools/latest || true
           fi
           rm -f ${CMDLINE_ZIP}
+          chmod -R +x cmdline-tools/latest/bin || true
 
-          # Обновим PATH временно
-          export PATH="${SDKROOT}/cmdline-tools/latest/bin:${SDKROOT}/platform-tools:${PATH}"
+          # Create legacy tools/bin path expected by some toolchains (Buildozer / p4a)
+          mkdir -p "${SDKROOT}/tools/bin"
+          if [ -f "${SDKROOT}/cmdline-tools/latest/bin/sdkmanager" ]; then
+            ln -sf "${SDKROOT}/cmdline-tools/latest/bin/sdkmanager" "${SDKROOT}/tools/bin/sdkmanager"
+            chmod +x "${SDKROOT}/tools/bin/sdkmanager" || true
+          fi
+          if [ -f "${SDKROOT}/cmdline-tools/latest/bin/avdmanager" ]; then
+            ln -sf "${SDKROOT}/cmdline-tools/latest/bin/avdmanager" "${SDKROOT}/tools/bin/avdmanager"
+            chmod +x "${SDKROOT}/tools/bin/avdmanager" || true
+          fi
+          mkdir -p "${SDKROOT}/tools/lib" || true
 
-          # Создаём конфиги
+          # Ensure .android config exists
           mkdir -p "${HOME}/.android"
           touch "${HOME}/.android/repositories.cfg" || true
 
-          # Установим требуемые компоненты (platform-tools, platform 36 и build-tools 36.1.0)
-          echo "Installing platform-tools, platforms;android-36 and build-tools;36.1.0"
-          yes | "${SDKROOT}/cmdline-tools/latest/bin/sdkmanager" --sdk_root="${SDKROOT}" "platform-tools" "platforms;android-36" "build-tools;36.1.0" || true
+          export PATH="${SDKROOT}/cmdline-tools/latest/bin:${PATH}"
 
-          # Принять лицензии неинтерактивно
+          # Helper: try sdkmanager install with retries (useful for CI glitches)
+          function sdk_install_retry() {
+            local pkg="$1"
+            local attempt=0
+            local max=4
+            while [ $attempt -lt $max ]; do
+              echo "Installing ${pkg} (attempt $((attempt+1))/$max)..."
+              yes | "${SDKROOT}/cmdline-tools/latest/bin/sdkmanager" --sdk_root="${SDKROOT}" "${pkg}" && break || true
+              attempt=$((attempt+1))
+              sleep $((attempt * 5))
+            done
+            if [ $attempt -ge $max ]; then
+              echo "Failed to install ${pkg} after ${max} attempts" >&2
+              # don't exit here — we will show diagnostics and fail later explicitly if necessary
+            fi
+          }
+
+          # Install multiple components to cover various p4a/buildozer expectations
+          sdk_install_retry "platform-tools"
+          sdk_install_retry "platforms;android-33"
+          sdk_install_retry "platforms;android-36"
+          sdk_install_retry "build-tools;33.0.2"
+          sdk_install_retry "build-tools;36.1.0"
+          # optional: add other build-tools if your buildozer requires them:
+          sdk_install_retry "build-tools;34.0.0" || true
+
+          # Accept all licenses non-interactively
           yes | "${SDKROOT}/cmdline-tools/latest/bin/sdkmanager" --sdk_root="${SDKROOT}" --licenses || true
 
-          # Сохраняем переменные окружения для следующих шагов
+          # Export env for later steps
           echo "ANDROID_SDK_ROOT=${SDKROOT}" >> $GITHUB_ENV
           echo "ANDROID_HOME=${SDKROOT}" >> $GITHUB_ENV
           echo "PATH=${SDKROOT}/cmdline-tools/latest/bin:${SDKROOT}/platform-tools:$HOME/.local/bin:${PATH}" >> $GITHUB_ENV
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
 
-          # Подготовим путь, где Buildozer ожидает SDK, и сделаем симлинк
+          # Make Buildozer's expected path point to this SDK
           mkdir -p "${HOME}/.buildozer/android/platform"
-          # удалим старый если есть
           if [ -L "${HOME}/.buildozer/android/platform/android-sdk" ] || [ -d "${HOME}/.buildozer/android/platform/android-sdk" ]; then
             rm -rf "${HOME}/.buildozer/android/platform/android-sdk"
           fi
           ln -s "${SDKROOT}" "${HOME}/.buildozer/android/platform/android-sdk"
           echo "Linked ${SDKROOT} -> ${HOME}/.buildozer/android/platform/android-sdk"
 
-          # Диагностика: покажем, что установлено
-          echo "=== sdkmanager --list ==="
+          # Diagnostics
+          echo "=== sdkmanager --list (short) ==="
           "${SDKROOT}/cmdline-tools/latest/bin/sdkmanager" --sdk_root="${SDKROOT}" --list || true
+          echo "SDK prepared"
 
-      - name: Install buildozer & cython (user)
+      - name: Install buildozer, cython and dependencies (user)
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install --user buildozer cython
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install --user buildozer cython==0.29.33
+          # add python-for-android pinned version if needed:
+          # python -m pip install --user python-for-android==2024.11.1
 
-      - name: Ensure ~/.local/bin is in PATH
+      - name: Ensure ~/.local/bin in PATH for subsequent steps
         run: echo "PATH=$HOME/.local/bin:$PATH" >> $GITHUB_ENV
 
-      - name: Initialize buildozer.spec if missing
+      - name: Ensure buildozer.spec contains required android options
         run: |
+          # If buildozer.spec missing — create minimal template
           if [ ! -f buildozer.spec ]; then
             buildozer init || true
           fi
+          # Ensure required properties exist or append them
+          grep -q "^android.accept_sdk_license" buildozer.spec || echo "android.accept_sdk_license = True" >> buildozer.spec
+          grep -q "^android.skip_update" buildozer.spec || echo "android.skip_update = False" >> buildozer.spec
+          # set android.api = 36 if not present
+          if grep -q "^android.api" buildozer.spec; then
+            sed -i "s/^android.api.*/android.api = 36/" buildozer.spec
+          else
+            echo "android.api = 36" >> buildozer.spec
+          fi
+          # set explicit build tools version
+          if grep -q "^android.build_tools_version" buildozer.spec; then
+            sed -i "s/^android.build_tools_version.*/android.build_tools_version = 36.1.0/" buildozer.spec
+          else
+            echo "android.build_tools_version = 36.1.0" >> buildozer.spec
+          fi
+          echo "Adjusted buildozer.spec (android.accept_sdk_license, android.skip_update, android.api=36, android.build_tools_version=36.1.0)"
 
-      - name: Show environment (diagnostics)
+      - name: Show diagnostic environment info
         run: |
           echo "JAVA_HOME=$JAVA_HOME"
           echo "ANDROID_HOME=$ANDROID_HOME"
@@ -106,21 +189,20 @@ jobs:
           echo "PATH=$PATH"
           which sdkmanager || true
           sdkmanager --version || true
-        shell: bash
+          ls -la "$ANDROID_SDK_ROOT/build-tools" || true
 
-      - name: Build debug APK with Buildozer
+      - name: Build debug APK with Buildozer (verbose)
         run: |
           set -euo pipefail
-          # Убедимся, что buildozer доступен
           export PATH=$HOME/.local/bin:$PATH
-          echo "Running buildozer -v android debug (this may take long on first run)"
+          echo "Starting buildozer -v android debug (may take long for first run)..."
           buildozer -v android debug
         shell: bash
         timeout-minutes: 120
 
       - name: List bin directory (for debugging)
         run: |
-          echo "Contents of project bin/ directory:"
+          echo "Contents of project bin/ directory (if created):"
           ls -la bin || true
 
       - name: Upload APK artifact
